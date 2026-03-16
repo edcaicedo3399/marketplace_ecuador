@@ -31,7 +31,6 @@ def guardar_visto(listing_id: str):
 
 def guardar_resultado(listing: dict):
     """Guarda el listing en CSV y JSON."""
-    # Limpiar campos que no van bien en CSV
     listing_csv = {k: v for k, v in listing.items() if k != 'foto_urls'}
     file_exists = os.path.exists(CSV_SALIDA)
     with open(CSV_SALIDA, "a", newline="", encoding="utf-8") as f:
@@ -39,49 +38,61 @@ def guardar_resultado(listing: dict):
         if not file_exists:
             writer.writeheader()
         writer.writerow(listing_csv)
-
     datos = []
     if os.path.exists(JSON_SALIDA):
         with open(JSON_SALIDA, "r", encoding="utf-8") as f:
-            try:
-                datos = json.load(f)
-            except:
-                datos = []
+            try: datos = json.load(f)
+            except: datos = []
     datos.append(listing)
     with open(JSON_SALIDA, "w", encoding="utf-8") as f:
         json.dump(datos, f, ensure_ascii=False, indent=2)
 
 
-def scrapear_marketplace(page, busqueda: dict) -> list:
-    """Scrapea Facebook Marketplace y verifica fotos de cada listing."""
-    query = busqueda["query"].replace(" ", "%20")
-    url = f"https://www.facebook.com/marketplace/{CIUDAD}/search?query={query}&radius={RADIO_KM}"
+def scroll_hasta_fin(page, max_sin_cambio=3, pausa_min=2.5, pausa_max=4.0):
+    """
+    Hace scroll hacia abajo hasta que Facebook no cargue
+    mas listings nuevos. Para cuando 3 scrolls seguidos
+    no aumentan el numero de items.
+    Retorna el total de items encontrados.
+    """
+    ultimo_total = 0
+    sin_cambio = 0
+    ronda = 0
 
-    print(f"\nBuscando: {busqueda['nombre']}")
-    page.goto(url, wait_until='domcontentloaded')
-    time.sleep(random.uniform(3, 6))
-
-    # Scroll para cargar mas resultados
-    for _ in range(3):
+    while sin_cambio < max_sin_cambio:
+        ronda += 1
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        time.sleep(random.uniform(2, 3))
+        time.sleep(random.uniform(pausa_min, pausa_max))
 
+        items_ahora = len(page.query_selector_all('a[href*="/marketplace/item/"]'))
+
+        if items_ahora == ultimo_total:
+            sin_cambio += 1
+            print(f"      Scroll {ronda}: sin cambio ({sin_cambio}/{max_sin_cambio})")
+        else:
+            nuevos = items_ahora - ultimo_total
+            print(f"      Scroll {ronda}: +{nuevos} items (total: {items_ahora})")
+            sin_cambio = 0
+            ultimo_total = items_ahora
+
+    print(f"   Scroll completo: {ultimo_total} items cargados en {ronda} scrolls")
+    return ultimo_total
+
+
+def extraer_listings_de_pagina(page):
+    """Extrae todos los listings visibles en la pagina despues del scroll."""
     items = page.query_selector_all('a[href*="/marketplace/item/"]')
-    print(f"   Cards encontradas: {len(items)}")
-
     listings_base = []
-    ids_vistos_en_pagina = set()
+    ids_vistos = set()
 
     for item in items:
         try:
             href = item.get_attribute("href") or ""
             match = re.search(r'/marketplace/item/(\d+)', href)
-            if not match:
-                continue
+            if not match: continue
             listing_id = match.group(1)
-            if listing_id in ids_vistos_en_pagina:
-                continue
-            ids_vistos_en_pagina.add(listing_id)
+            if listing_id in ids_vistos: continue
+            ids_vistos.add(listing_id)
 
             texto_card = item.inner_text() or ""
             lineas = [l.strip() for l in texto_card.split('\n') if l.strip()]
@@ -97,34 +108,92 @@ def scrapear_marketplace(page, busqueda: dict) -> list:
                 "motor": motor,
                 "anio": anio,
                 "url": f"https://www.facebook.com/marketplace/item/{listing_id}",
-                "busqueda": busqueda["nombre"],
             })
-        except Exception as e:
+        except:
             continue
 
-    print(f"   Listings unicos: {len(listings_base)}")
+    return listings_base
 
-    # Ahora entrar a cada listing para verificar fotos
+
+def scrapear_marketplace(page, busqueda: dict) -> list:
+    """
+    Scrapea Facebook Marketplace haciendo scroll hasta el final
+    para capturar TODOS los listings disponibles, no solo los primeros.
+    """
+    query = busqueda["query"].replace(" ", "%20")
+    url = f"https://www.facebook.com/marketplace/{CIUDAD}/search?query={query}&radius={RADIO_KM}"
+
+    print(f"\nBuscando: {busqueda['nombre']}")
+    print(f"   URL: {url}")
+    page.goto(url, wait_until='domcontentloaded')
+    time.sleep(random.uniform(3, 5))
+
+    # --- SCROLL INTELIGENTE hasta el final de la pagina ---
+    print(f"   Iniciando scroll inteligente...")
+    total_cargados = scroll_hasta_fin(
+        page,
+        max_sin_cambio=3,   # Para si 3 scrolls no cargan nada nuevo
+        pausa_min=2.5,
+        pausa_max=4.0
+    )
+
+    # --- Extraer todos los listings ---
+    listings_base = extraer_listings_de_pagina(page)
+    print(f"   Cards unicas extraidas: {len(listings_base)}")
+
+    # --- Estadisticas rapidas de lo encontrado ---
+    motores = {}
+    for l in listings_base:
+        m = l.get('motor', 'desconocido')
+        motores[m] = motores.get(m, 0) + 1
+    print(f"   Distribucion por motor: {motores}")
+
+    # --- Entrar a cada listing para verificar fotos y vendedor ---
     listings_completos = []
     for i, listing in enumerate(listings_base):
         try:
-            print(f"   [{i+1}/{len(listings_base)}] Verificando fotos: {listing['titulo'][:50]}")
+            titulo_corto = listing['titulo'][:45]
+            precio_txt = f"${listing['precio']:,.0f}" if listing.get('precio') else 'N/A'
+            print(f"   [{i+1}/{len(listings_base)}] {titulo_corto} | {precio_txt}")
 
+            # Verificar fotos
             info_fotos = verificar_fotos(listing['url'], page)
             listing.update(info_fotos)
             listing['puntaje'] = puntaje_calidad(listing)
-            listing["fecha_encontrado"] = datetime.now().isoformat()
+            listing['busqueda'] = busqueda['nombre']
+            listing['fecha_encontrado'] = datetime.now().isoformat()
 
-            print(f"      Fotos: {info_fotos['cantidad_fotos']} | Puntaje: {listing['puntaje']}/10")
+            fotos = info_fotos['cantidad_fotos']
+            puntaje = listing['puntaje']
+            motor = listing.get('motor', '?')
+
+            # Mostrar resultado del analisis
+            if es_oportunidad(listing, busqueda):
+                print(f"      OPORTUNIDAD Motor:{motor} | Fotos:{fotos} | Puntaje:{puntaje}/10")
+            elif fotos < 3:
+                print(f"      DESCARTADO pocas fotos ({fotos})")
+            elif motor not in [busqueda.get('motor_objetivo'), 'desconocido']:
+                print(f"      DESCARTADO motor {motor} != {busqueda.get('motor_objetivo')}")
+            else:
+                print(f"      Motor:{motor} | Fotos:{fotos} | Puntaje:{puntaje}/10")
+
             listings_completos.append(listing)
-
-            # Pausa entre requests para no ser bloqueado
-            time.sleep(random.uniform(1.5, 3))
+            time.sleep(random.uniform(1.5, 3.0))
 
         except Exception as e:
             print(f"      Error: {e}")
             listings_completos.append(listing)
             continue
+
+    # Resumen final de esta busqueda
+    oportunidades = [l for l in listings_completos if es_oportunidad(l, busqueda)]
+    descartados = len(listings_completos) - len(oportunidades)
+    print(f"")
+    print(f"   RESUMEN {busqueda['nombre']}:")
+    print(f"   Total analizados : {len(listings_completos)}")
+    print(f"   Oportunidades    : {len(oportunidades)}")
+    print(f"   Descartados      : {descartados}")
+    print(f"   {'=' * 40}")
 
     return listings_completos
 
@@ -132,10 +201,12 @@ def scrapear_marketplace(page, busqueda: dict) -> list:
 def run():
     """Funcion principal del scraper."""
     print("=" * 55)
-    print("  marketplace_ecuador - Iniciando con filtro de fotos")
+    print("  marketplace_ecuador")
+    print("  Scroll inteligente - captura TODOS los listings")
     print("=" * 55)
 
     vistos = cargar_vistos()
+    stats_dia = {'total': 0, 'oportunidades': 0, 'estafas': 0, 'duplicados': 0}
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -149,12 +220,12 @@ def run():
         )
         page = context.new_page()
 
-        print("\nAbre Facebook y asegurate de estar logueado...")
         page.goto("https://www.facebook.com/marketplace/")
         time.sleep(5)
 
         while True:
             print(f"\nRevision: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            stats_dia = {'total': 0, 'oportunidades': 0, 'estafas': 0, 'duplicados': 0}
 
             for busqueda in BUSQUEDAS:
                 try:
@@ -169,24 +240,18 @@ def run():
                             guardar_visto(lid)
                             vistos.add(lid)
                             nuevos += 1
-
+                            stats_dia['total'] += 1
                             if es_oportunidad(listing, busqueda):
                                 oportunidades += 1
-                                fotos = listing.get('cantidad_fotos', 0)
-                                puntaje = listing.get('puntaje', 0)
-                                print(f"\n   OPORTUNIDAD [{puntaje}/10 pts | {fotos} fotos]")
-                                print(f"   Titulo: {listing['titulo']}")
-                                print(f"   Motor:  {listing['motor']}")
-                                print(f"   Precio: ${listing.get('precio', 'N/A')}")
-                                print(f"   URL:    {listing['url']}")
+                                stats_dia['oportunidades'] += 1
                                 enviar_alerta_telegram(listing)
 
-                    print(f"\n   Nuevos: {nuevos} | Oportunidades con buenas fotos: {oportunidades}")
+                    print(f"   Nuevos guardados: {nuevos} | Oportunidades: {oportunidades}")
 
                 except Exception as e:
-                    print(f"   Error: {e}")
+                    print(f"   Error en '{busqueda['nombre']}': {e}")
 
-            print(f"\nEsperando {INTERVALO_MINUTOS} min...")
+            print(f"\nEsperando {INTERVALO_MINUTOS} min para proxima revision...")
             time.sleep(INTERVALO_MINUTOS * 60)
 
         browser.close()

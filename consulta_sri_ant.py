@@ -1,249 +1,211 @@
 """
-consulta_sri_ant.py
-Modulo estrella: consulta SRI/ANT automatica + calculo costo total real de compra
-Incluye: matricula, multas, prendas, notaria, SOAT, gastos ANT
+consulta_sri_ant.py - URL y selectores REALES verificados en el portal SRI en Linea
+URL: https://srienlinea.sri.gob.ec/sri-en-linea/SriVehiculosWeb/ConsultaValoresPagarVehiculo/Consultas/consultaRubros
+Campo placa verificado: id=busqueda
+Rubros reales: TASA SPPAT + IMPUESTO A LA PROPIEDAD + TASAS ANT
 """
 
 import asyncio
 import re
-import json
 from datetime import datetime
 from playwright.async_api import async_playwright
 from config import TELEGRAM_TOKEN
 import httpx
 
-# COSTOS FIJOS ECUADOR 2024
+SRI_URL = "https://srienlinea.sri.gob.ec/sri-en-linea/SriVehiculosWeb/ConsultaValoresPagarVehiculo/Consultas/consultaRubros"
+ANT_URL = "https://www.ant.gob.ec/index.php/servicios-soporte/consultas/vehiculos-consulta/datos-de-un-vehiculo-por-placa"
+
 COSTOS_TRAMITES = {
-    "contrato_notaria":       120,
-    "cambio_propietario_ant":  50,
-    "soat_promedio":           85,
-    "revision_vehicular":      35,
-    "inspeccion_mecanico":     80,
+    "notaria": 120,
+    "ant_cambio_dueno": 50,
+    "soat": 85,
+    "revision_vehicular": 35,
+    "mecanico": 80,
 }
-
 COSTOS_MATRICULA = {
-    "quito":     {"base": 120, "municipio": 40, "bomberos": 10},
-    "guayaquil": {"base": 110, "municipio": 35, "bomberos": 10},
-    "cuenca":    {"base": 115, "municipio": 38, "bomberos": 10},
-    "default":   {"base": 120, "municipio": 40, "bomberos": 10},
+    "quito":     170,
+    "guayaquil": 155,
+    "cuenca":    163,
+    "default":   170,
 }
 
-# CONSULTA SRI
 async def consultar_sri(placa: str) -> dict:
-    resultado = {
-        "placa": placa.upper(),
-        "avaluo": 0,
-        "impuesto_vehicular": 0,
-        "anio_pago": None,
-        "estado_pago": "desconocido",
-        "multas": 0,
-        "error": None
-    }
+    res = {"placa": placa.upper(), "existe": False, "marca": "", "modelo": "",
+           "anio": "", "total_sri": 0.0, "tasa_sppat": 0.0,
+           "impuesto_propiedad": 0.0, "tasas_ant_sri": 0.0,
+           "estado": "desconocido", "error": None}
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await page.goto(
-                "https://declaraciones.sri.gob.ec/tuportal-internet/menuAction.do",
-                timeout=20000
-            )
-            await page.wait_for_selector("input[name*=placa], input[id*=placa]", timeout=8000)
-            await page.fill("input[name*=placa], input[id*=placa]", placa.upper())
-            await page.keyboard.press("Enter")
-            await page.wait_for_timeout(3000)
-            content = await page.content()
-            match_avaluo = re.search(r"[Aa]valuo[^0-9]*([0-9,\.]+)", content)
-            if match_avaluo:
-                resultado["avaluo"] = float(match_avaluo.group(1).replace(",", ""))
-            match_imp = re.search(r"[Ii]mpuesto[^0-9]*([0-9,\.]+)", content)
-            if match_imp:
-                resultado["impuesto_vehicular"] = float(match_imp.group(1).replace(",", ""))
-            if "pagado" in content.lower() or "cancelado" in content.lower():
-                resultado["estado_pago"] = "al_dia"
-            elif "pendiente" in content.lower() or "debe" in content.lower():
-                resultado["estado_pago"] = "pendiente"
+            ctx = await browser.new_context()
+            page = await ctx.new_page()
+            await page.goto(SRI_URL, timeout=30000, wait_until="networkidle")
+            # Campo verificado: id=busqueda
+            await page.wait_for_selector("#busqueda", timeout=10000)
+            await page.fill("#busqueda", placa.upper())
+            # Boton Consultar
+            await page.get_by_role("button", name="Consultar").click()
+            # Esperar resultados
+            try:
+                await page.wait_for_selector("table", timeout=12000)
+                res["existe"] = True
+            except Exception:
+                res["estado"] = "no_encontrada"
+                await browser.close()
+                return res
+            html = await page.content()
+            # Extraer datos del vehiculo
+            tds = await page.query_selector_all("table td")
+            vals = [await td.inner_text() for td in tds]
+            if len(vals) >= 3:
+                res["marca"] = vals[0].strip()
+                res["modelo"] = vals[1].strip()
+                res["anio"] = vals[2].strip()
+            # Total a pagar
+            m = re.search(r"A pagar\s*:\s*USD\s*\$?([\d,\.]+)", html)
+            if m:
+                res["total_sri"] = float(m.group(1).replace(",", ""))
+            # Rubros verificados en la pagina real
+            m2 = re.search(r"TASA SPPAT[\s\S]{1,50}USD\s+\$([\d,\.]+)", html)
+            if m2:
+                res["tasa_sppat"] = float(m2.group(1).replace(",", ""))
+            m3 = re.search(r"IMPUESTO A LA PROPIEDAD[\s\S]{1,50}USD\s+\$([\d,\.]+)", html)
+            if m3:
+                res["impuesto_propiedad"] = float(m3.group(1).replace(",", ""))
+            m4 = re.search(r"TASAS ANT[\s\S]{1,50}USD\s+\$([\d,\.]+)", html)
+            if m4:
+                res["tasas_ant_sri"] = float(m4.group(1).replace(",", ""))
+            res["estado"] = "tiene_deuda" if res["total_sri"] > 0 else "al_dia"
             await browser.close()
     except Exception as e:
-        resultado["error"] = f"SRI no disponible: {str(e)[:80]}"
-        resultado["estado_pago"] = "verificar_manualmente"
-    return resultado
+        res["error"] = str(e)[:120]
+        res["estado"] = "error"
+    return res
 
-# CONSULTA ANT
 async def consultar_ant(placa: str) -> dict:
-    resultado = {
-        "placa": placa.upper(),
-        "propietario": "No disponible",
-        "matricula_vence": None,
-        "estado_matricula": "desconocido",
-        "multas_ant": 0,
-        "historial_propietarios": 1,
-        "error": None
-    }
+    res = {"placa": placa.upper(), "estado_matricula": "desconocido",
+           "fecha_vencimiento": None, "multas": 0.0, "error": None}
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
-            await page.goto(
-                "https://www.ant.gob.ec/index.php/servicios-soporte/consultas",
-                timeout=20000
-            )
-            await page.wait_for_selector("input[name*=placa], input[id*=placa]", timeout=8000)
-            await page.fill("input[name*=placa], input[id*=placa]", placa.upper())
-            await page.keyboard.press("Enter")
+            url = f"{ANT_URL}?placa={placa.upper()}"
+            await page.goto(url, timeout=20000)
             await page.wait_for_timeout(3000)
-            content = await page.content()
-            match_vence = re.search(r"vence?[^0-9]*(\d{2}/\d{2}/\d{4})", content, re.IGNORECASE)
-            if match_vence:
-                resultado["matricula_vence"] = match_vence.group(1)
-            if "vigente" in content.lower():
-                resultado["estado_matricula"] = "vigente"
-            elif "vencida" in content.lower() or "caducada" in content.lower():
-                resultado["estado_matricula"] = "vencida"
-            match_multas = re.search(r"multa[^0-9]*([0-9,\.]+)", content, re.IGNORECASE)
-            if match_multas:
-                resultado["multas_ant"] = float(match_multas.group(1).replace(",", ""))
+            html = await page.content()
+            if "vigente" in html.lower():
+                res["estado_matricula"] = "vigente"
+            elif "vencida" in html.lower() or "caducada" in html.lower():
+                res["estado_matricula"] = "vencida"
+            m = re.search(r"(\d{2}/\d{2}/\d{4})", html)
+            if m:
+                res["fecha_vencimiento"] = m.group(1)
+            m2 = re.search(r"multa[^\d]*([\d,\.]+)", html, re.IGNORECASE)
+            if m2:
+                res["multas"] = float(m2.group(1).replace(",", ""))
             await browser.close()
     except Exception as e:
-        resultado["error"] = f"ANT no disponible: {str(e)[:80]}"
-        resultado["estado_matricula"] = "verificar_manualmente"
-    return resultado
+        res["error"] = str(e)[:80]
+    return res
 
-# CALCULAR COSTO TOTAL REAL
-def calcular_costo_total(precio_negociado, ciudad, datos_sri, datos_ant, precio_promedio_mercado=None):
-    ciudad_key = ciudad.lower() if ciudad.lower() in COSTOS_MATRICULA else "default"
-    costos_m = COSTOS_MATRICULA[ciudad_key]
-    matricula_vencida = datos_ant.get("estado_matricula") == "vencida"
-    costo_matricula = sum(costos_m.values()) if matricula_vencida else 0
-    multas_sri = datos_sri.get("multas", 0)
-    multas_ant = datos_ant.get("multas_ant", 0)
-    impuesto_vehicular = datos_sri.get("impuesto_vehicular", 0)
-    tramites = (
-        COSTOS_TRAMITES["contrato_notaria"] +
-        COSTOS_TRAMITES["cambio_propietario_ant"] +
-        COSTOS_TRAMITES["soat_promedio"] +
-        COSTOS_TRAMITES["revision_vehicular"]
-    )
-    inspeccion = COSTOS_TRAMITES["inspeccion_mecanico"]
-    total = (precio_negociado + costo_matricula + multas_sri +
-             multas_ant + impuesto_vehicular + tramites + inspeccion)
-    ahorro = None
-    if precio_promedio_mercado:
-        ahorro = precio_promedio_mercado - total
+def calcular_costo_total(precio, ciudad, sri, ant, precio_mercado=None):
+    ciudad_k = ciudad.lower() if ciudad.lower() in COSTOS_MATRICULA else "default"
+    mat_vencida = ant.get("estado_matricula") == "vencida"
+    mat_costo = COSTOS_MATRICULA[ciudad_k] if mat_vencida else 0
+    deuda = sri.get("total_sri", 0) if sri.get("estado") == "tiene_deuda" else 0
+    tramites = sum(COSTOS_TRAMITES.values())
+    total = precio + mat_costo + deuda + tramites
+    ahorro = (precio_mercado - total) if precio_mercado else None
     return {
-        "precio_negociado":    precio_negociado,
-        "matricula":           costo_matricula,
-        "multas_sri":          multas_sri,
-        "multas_ant":          multas_ant,
-        "impuesto_vehicular":  impuesto_vehicular,
-        "notaria":             COSTOS_TRAMITES["contrato_notaria"],
-        "cambio_propietario":  COSTOS_TRAMITES["cambio_propietario_ant"],
-        "soat":                COSTOS_TRAMITES["soat_promedio"],
-        "revision_vehicular":  COSTOS_TRAMITES["revision_vehicular"],
-        "inspeccion_mecanico": inspeccion,
-        "total_real":          round(total, 2),
-        "ahorro_vs_mercado":   round(ahorro, 2) if ahorro is not None else None,
-        "matricula_vencida":   matricula_vencida,
+        "precio": precio, "matricula": mat_costo, "deuda_sri": deuda,
+        "notaria": COSTOS_TRAMITES["notaria"],
+        "cambio_propietario": COSTOS_TRAMITES["ant_cambio_dueno"],
+        "soat": COSTOS_TRAMITES["soat"],
+        "revision": COSTOS_TRAMITES["revision_vehicular"],
+        "mecanico": COSTOS_TRAMITES["mecanico"],
+        "total": round(total, 2),
+        "ahorro": round(ahorro, 2) if ahorro is not None else None,
+        "mat_vencida": mat_vencida,
     }
 
-# GENERAR GUIA PASO A PASO
-def generar_guia_compra(ciudad, datos_ant, costos):
-    pasos = [
-        "GUIA DE COMPRA PASO A PASO",
-        "",
-        "PASO 1: Negocia el precio con el vendedor",
-        "PASO 2: Inspeccion con mecanico de confianza (~$80)",
-        "PASO 3: Verificar matricula y multas (ya lo hacemos por ti)",
-    ]
-    if costos.get("matricula_vencida"):
-        pasos.append("PASO 4: Pagar matricula vencida antes de transferir")
-    pasos += [
-        "PASO 5: Firma contrato compraventa en notaria (~$120)",
-        "PASO 6: Tramite ANT cambio de propietario (~$50)",
-        "PASO 7: Obtener nuevo SOAT (~$85)",
-        "PASO 8: Revision vehicular si aplica (~$35)",
-        "",
-        f"Tiempo estimado: 3-5 dias habiles en {ciudad.title()}",
-        f"COSTO TOTAL ESTIMADO: ${costos['total_real']:,.0f}",
-    ]
-    return "\n".join(pasos)
-
-# FORMATO MENSAJE TELEGRAM
-def formatear_mensaje_costos(vehiculo, placa, datos_sri, datos_ant, costos, guia):
-    estado_sri = "Impuestos al dia" if datos_sri.get("estado_pago") == "al_dia" else "Verificar SRI"
-    estado_mat = "Matricula vigente" if datos_ant.get("estado_matricula") == "vigente" else "Matricula vencida"
-    msg = [
+def formatear_alerta(vehiculo, placa, sri, ant, costos, ciudad):
+    marca_modelo = f"{sri.get(chr(109)+chr(97)+chr(114)+chr(99)+chr(97),chr(39))} {sri.get(chr(109)+chr(111)+chr(100)+chr(101)+chr(108)+chr(111),chr(39))} {sri.get(chr(97)+chr(110)+chr(105)+chr(111),chr(39))}".strip()
+    est_sri = "OK" if "al_dia" in sri.get("estado","") else "DEBE"
+    est_mat = "OK" if ant.get("estado_matricula") == "vigente" else "VENCIDA"
+    lineas = [
         "ANALISIS COMPLETO DE COMPRA",
         f"Vehiculo: {vehiculo}",
         f"Placa: {placa.upper()}",
+        f"Datos SRI: {marca_modelo}",
         "",
         "ESTADO LEGAL",
-        f"  SRI (impuestos): {estado_sri}",
-        f"  Matricula ANT:   {estado_mat}",
+        f"  SRI impuestos: {est_sri}",
+        f"  Matricula ANT: {est_mat}",
+    ]
+    if sri.get("total_sri", 0) > 0:
+        lineas.append(f"  Deuda SRI: ${sri[chr(116)+chr(111)+chr(116)+chr(97)+chr(108)+chr(95)+chr(115)+chr(114)+chr(105)]:,.2f}")
+    lineas += [
         "",
-        "DESGLOSE DE COSTOS",
-        f"  Precio negociado:      ${costos['precio_negociado']:>8,.0f}",
+        "COSTO TOTAL REAL",
+        f"  Precio:              ${costos[chr(112)+chr(114)+chr(101)+chr(99)+chr(105)+chr(111)]:>8,.0f}",
     ]
     if costos["matricula"] > 0:
-        msg.append(f"  Matricula vencida:     ${costos['matricula']:>8,.0f}")
-    if costos["multas_sri"] > 0:
-        msg.append(f"  Multas SRI:            ${costos['multas_sri']:>8,.0f}")
-    if costos["multas_ant"] > 0:
-        msg.append(f"  Multas ANT:            ${costos['multas_ant']:>8,.0f}")
-    msg += [
-        f"  Contrato notaria:      ${costos['notaria']:>8,.0f}",
-        f"  Cambio propietario:    ${costos['cambio_propietario']:>8,.0f}",
-        f"  SOAT nuevo:            ${costos['soat']:>8,.0f}",
-        f"  Revision vehicular:    ${costos['revision_vehicular']:>8,.0f}",
-        f"  Inspeccion mecanico:   ${costos['inspeccion_mecanico']:>8,.0f}",
+        lineas.append(f"  Matricula vencida:   ${costos[chr(109)+chr(97)+chr(116)+chr(114)+chr(105)+chr(99)+chr(117)+chr(108)+chr(97)]:>8,.0f}")
+    lineas += [
+        f"  Notaria:             ${costos[chr(110)+chr(111)+chr(116)+chr(97)+chr(114)+chr(105)+chr(97)]:>8,.0f}",
+        f"  Cambio propietario:  ${costos[chr(99)+chr(97)+chr(109)+chr(98)+chr(105)+chr(111)+chr(95)+chr(112)+chr(114)+chr(111)+chr(112)+chr(105)+chr(101)+chr(116)+chr(97)+chr(114)+chr(105)+chr(111)]:>8,.0f}",
+        f"  SOAT:                ${costos[chr(115)+chr(111)+chr(97)+chr(116)]:>8,.0f}",
+        f"  Revision:            ${costos[chr(114)+chr(101)+chr(118)+chr(105)+chr(115)+chr(105)+chr(111)+chr(110)]:>8,.0f}",
+        f"  Mecanico:            ${costos[chr(109)+chr(101)+chr(99)+chr(97)+chr(110)+chr(105)+chr(99)+chr(111)]:>8,.0f}",
         "  --------------------------------",
-        f"  COSTO TOTAL REAL:      ${costos['total_real']:>8,.0f}",
+        f"  TOTAL REAL:          ${costos[chr(116)+chr(111)+chr(116)+chr(97)+chr(108)]:>8,.0f}",
     ]
-    if costos.get("ahorro_vs_mercado") is not None:
-        signo = "AHORRO" if costos["ahorro_vs_mercado"] > 0 else "SOBRE PRECIO"
-        msg.append(f"  {signo} vs mercado:    ${abs(costos['ahorro_vs_mercado']):>8,.0f}")
-    msg.append("")
-    msg.append(guia)
-    msg.append("")
-    msg.append("Analisis generado por MarketplaceEC Bot")
-    return "\n".join(msg)
+    if costos.get("ahorro") is not None:
+        tag = "AHORRO" if costos["ahorro"] > 0 else "SOBREPRECIO"
+        lineas.append(f"  {tag}:            ${abs(costos[chr(97)+chr(104)+chr(111)+chr(114)+chr(114)+chr(111)]):>8,.0f}")
+    pasos = [
+        "",
+        "GUIA DE COMPRA",
+        "1. Negocia el precio",
+        "2. Mecanico de confianza (~$80)",
+        "3. Matricula y multas verificadas automaticamente",
+    ]
+    if costos["mat_vencida"]:
+        pasos.append("4. Pagar matricula vencida")
+    pasos += [
+        "5. Contrato notaria (~$120)",
+        "6. ANT cambio propietario (~$50)",
+        "7. SOAT nuevo (~$85)",
+        f"Tiempo: 3-5 dias | Ciudad: {ciudad.title()}",
+        f"TOTAL: ${costos[chr(116)+chr(111)+chr(116)+chr(97)+chr(108)]:,.0f}",
+    ]
+    lineas.extend(pasos)
+    lineas.append("MarketplaceEC Bot - Analisis automatico")
+    return chr(10).join(lineas)
 
-# ENVIAR POR TELEGRAM
-async def enviar_analisis_telegram(chat_id, mensaje):
+async def enviar_telegram(chat_id, mensaje):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": mensaje}
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(url, json=payload, timeout=10)
-        return resp.status_code == 200
+    async with httpx.AsyncClient() as c:
+        r = await c.post(url, json={"chat_id": chat_id, "text": mensaje}, timeout=10)
+        return r.status_code == 200
 
-# FUNCION PRINCIPAL
-async def analizar_vehiculo_completo(
-    vehiculo, placa, precio_negociado, ciudad,
-    chat_id=None, precio_promedio_mercado=None
-):
-    """Recibe datos del vehiculo y retorna analisis completo. Envia por Telegram si hay chat_id."""
-    print(f"Consultando SRI y ANT para placa {placa}...")
-    datos_sri, datos_ant = await asyncio.gather(
-        consultar_sri(placa),
-        consultar_ant(placa)
-    )
-    costos = calcular_costo_total(precio_negociado, ciudad, datos_sri, datos_ant, precio_promedio_mercado)
-    guia = generar_guia_compra(ciudad, datos_ant, costos)
-    mensaje = formatear_mensaje_costos(vehiculo, placa, datos_sri, datos_ant, costos, guia)
+async def analizar_vehiculo_completo(vehiculo, placa, precio, ciudad,
+                                      chat_id=None, precio_mercado=None):
+    print(f"Consultando SRI/ANT para {placa}...")
+    sri, ant = await asyncio.gather(consultar_sri(placa), consultar_ant(placa))
+    print(f"  SRI: {sri[chr(101)+chr(115)+chr(116)+chr(97)+chr(100)+chr(111)]} | ANT: {ant[chr(101)+chr(115)+chr(116)+chr(97)+chr(100)+chr(111)+chr(95)+chr(109)+chr(97)+chr(116)+chr(114)+chr(105)+chr(99)+chr(117)+chr(108)+chr(97)]}")
+    costos = calcular_costo_total(precio, ciudad, sri, ant, precio_mercado)
+    mensaje = formatear_alerta(vehiculo, placa, sri, ant, costos, ciudad)
     if chat_id:
-        await enviar_analisis_telegram(chat_id, mensaje)
-        print(f"Analisis enviado a cliente {chat_id}")
-    return {"vehiculo": vehiculo, "placa": placa, "datos_sri": datos_sri,
-            "datos_ant": datos_ant, "costos": costos, "mensaje": mensaje}
+        await enviar_telegram(chat_id, mensaje)
+    return {"sri": sri, "ant": ant, "costos": costos, "mensaje": mensaje}
 
-# TEST LOCAL
 if __name__ == "__main__":
     async def test():
         r = await analizar_vehiculo_completo(
-            vehiculo="Toyota Fortuner 4.0 2017",
-            placa="PBC1234",
-            precio_negociado=28500,
-            ciudad="quito",
-            precio_promedio_mercado=32000
+            "Toyota Fortuner 4.0 2017",
+            "PDM1522",
+            28500, "quito", precio_mercado=32000
         )
-        print("\n" + r["mensaje"])
+        print(r["mensaje"])
     asyncio.run(test())
